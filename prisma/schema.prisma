@@ -1,0 +1,424 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Bookmaker {
+  id          String  @id @default(uuid())
+  slug        String  @unique
+  name        String
+  apiEndpoint String? @db.Text
+  active      Boolean @default(true)
+
+  bookmakerMatches BookmakerMatch[]
+  calibrationSubmissions CalibrationSubmission[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model CalibrationSubmission {
+  id          String    @id @default(uuid())
+  bookmakerId String
+  bookmaker   Bookmaker @relation(fields: [bookmakerId], references: [id], onDelete: Cascade)
+  sportSlug   String    // "football" | "hockey" | "tennis"
+
+  kind String // "url" | "photo"
+  url  String? @db.Text
+  // Путь к сохранённому файлу фото (relative, под /opt/betmark/ calibration-uploads/) - сами байты не в БД, только путь
+  photoPath String? @db.Text
+
+  status CalibrationStatus @default(PENDING)
+
+  // Что извлёк ИИ/парсер при проверке - для прозрачности в UI ("бот увидел именно это", а не чёрный ящик)
+  extractedLeagueName String? @db.Text
+  extractedTeams      String? @db.Text
+  matchesFound         Int?
+  message              String? @db.Text // человекочитаемый итог/ошибка
+
+  createdAt  DateTime  @default(now())
+  resolvedAt DateTime?
+
+  @@index([bookmakerId])
+  @@index([status])
+}
+
+enum CalibrationStatus {
+  PENDING  // отправлено, проверка ещё не запускалась/идёт
+  VERIFIED // (только "url"/Book B-"photo") - проверено вживую, подключено к обходу
+  FAILED   // (только "url"/Book B-"photo") - проверено, но матчей/лиги не нашлось - самопочинка не удалась
+  FLAGGED  // (только "photo" у Book A/Book E/Book H/Book G) - заявка передана на ручной разбор
+}
+
+model Sport {
+  id   String @id @default(uuid())
+  slug String @unique
+  name String
+
+  leagues League[]
+
+  createdAt DateTime @default(now())
+}
+
+model League {
+  id      String @id @default(uuid())
+  name    String
+  country String?
+
+  sportId String
+  sport   Sport  @relation(fields: [sportId], references: [id], onDelete: Cascade)
+
+  matches Match[]
+
+  createdAt DateTime @default(now())
+
+  @@index([sportId])
+}
+
+enum MatchStatus {
+  UPCOMING
+  LIVE
+  FINISHED
+  CANCELLED
+}
+
+// Нормализованное представление ОДНОГО реального матча - результат сведения между разными букмекерскими конторами
+model Match {
+  id         String      @id @default(uuid())
+  homeTeam   String
+  awayTeam   String
+  kickoffAt  DateTime
+  status     MatchStatus @default(UPCOMING)
+
+  leagueId String
+  league   League @relation(fields: [leagueId], references: [id], onDelete: Cascade)
+
+  bookmakerMatches BookmakerMatch[]
+  liveTracking     LiveTracking[]
+
+  topLeagueFlagged      Boolean  @default(false)
+  topLeagueFlagReason   String?  @db.Text
+  topLeagueReviewAnswer Boolean?
+
+  // Удаление матча кнопкой на доске "у всех"
+  hiddenForAll Boolean   @default(false)
+  hiddenAt     DateTime?
+  hiddenBy     String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([leagueId])
+  @@index([kickoffAt])
+  @@index([status])
+  @@index([topLeagueFlagged])
+}
+
+enum LiveTrackingStatus {
+  SCHEDULED // выбран пользователем в /admin, ждём начала матча
+  TRACKING  // матч живой, опрашиваем каждые 5-10 сек
+  FINISHED  // матч закончился, отчёт (PDF) готов
+  FAILED    // не поймали live-событие у Book A или опрос упал с ошибкой
+}
+
+enum LiveDetailLevel {
+  MAX      // каждые 5 сек, пишет ВСЕГДА, даже без изменений
+  MODERATE // каждые 15 сек, пишет любое изменение кэфа
+  ULTRA    // как MODERATE + раз в 5 мин проверка на аномалии
+  STANDARD // каждые 30 сек, пишет только изменение >= 0.15
+  ECONOMY  // каждые 30 сек, пишет ТОЛЬКО в моменты голов
+}
+
+// Слежение за ОДНИМ выбранным пользователем матчем от старта до конца
+model LiveTracking {
+  id      String @id @default(uuid())
+  matchId String
+  match   Match  @relation(fields: [matchId], references: [id], onDelete: Cascade)
+
+  // сайт, на котором создано отслеживание - "main"
+  site String @default("main")
+  // откуда отслеживание: manual (вручную), autotrack (автоотслеживание лиги)
+  source String @default("manual")
+
+  status        LiveTrackingStatus @default(SCHEDULED)
+  bookaEventId String? // externalId матча в live-фиде Book A - находим, когда матч фактически стартует.
+  // Для site="crypto" здесь строка вида "alpha:<slug>:<externalId>" (якорь - live-лента Alpha этой конторы)
+  bookmakerSlugs String[] @default(["booka"])
+
+  detailLevel  LiveDetailLevel @default(MODERATE)
+  lastPolledAt DateTime?
+
+  startedAt DateTime? // когда реально поймали live-статус у Book A
+  endedAt   DateTime?
+  endReason String? @db.Text
+  scoreHome Int?
+  scoreAway Int?
+  matchMinute Int?
+  // Теннис счёт по геймам и очки текущего гейма, например "6:4 3:3 · 15:30"
+  scoreDetail String?
+  // Секунды от начала матча на карточке /live время показывается до секунд) - тот же источник
+  matchTimerSeconds Int?
+
+  bookgDelayed Boolean @default(false)
+
+  reportPath String? @db.Text // путь к готовому PDF-отчёту на диске
+  reportPathRaw String? @db.Text
+
+  lastAiCheckAt DateTime?
+
+  events LiveOddsEvent[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([matchId, site])
+  @@index([status])
+}
+
+// Одна строка = один зафиксированный МОМЕНТ (старт, гол, реальное изменение кэфа)
+model LiveOddsEvent {
+  id         String       @id @default(uuid())
+  trackingId String
+  tracking   LiveTracking @relation(fields: [trackingId], references: [id], onDelete: Cascade)
+
+  bookmakerSlug String // "booka" - остальные конторы добавятся сюда же по мере готовности адаптеров
+  price1        Float
+  priceX        Float? // null для видов спорта без ничьей (теннис)
+  price2        Float
+
+  isGoal    Boolean @default(false)
+  goalTeam  String? // "home" | "away"
+  scoreHome Int?
+  scoreAway Int?
+  matchMinute Int?
+  // Теннис геймы по сетам и очки текущего гейма на момент записи; у остальных видов спорта null
+  scoreDetail String?
+
+  unavailable Boolean @default(false)
+
+  aiFlagged    Boolean @default(false)
+  aiFlagReason String? @db.Text
+
+  capturedAt DateTime @default(now())
+
+  @@index([trackingId, capturedAt])
+}
+
+// Связь: конкретный матч у конкретной БК (её собственный внутренний ID этого события)
+model BookmakerMatch {
+  id                  String  @id @default(uuid())
+  externalId          String  @db.Text
+  sourceUrl           String? @db.Text
+  rawHomeTeam         String
+  rawAwayTeam         String
+  teamsSwapped        Boolean @default(false)
+
+  matchId     String
+  match       Match     @relation(fields: [matchId], references: [id], onDelete: Cascade)
+
+  bookmakerId String
+  bookmaker   Bookmaker @relation(fields: [bookmakerId], references: [id], onDelete: Cascade)
+
+  oddsSnapshots OddsSnapshot[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([bookmakerId, externalId])
+  @@index([matchId])
+}
+
+enum MarketType {
+  MATCH_WINNER_1X2
+  TOTAL_OVER_UNDER
+  HANDICAP
+  BOTH_TEAMS_TO_SCORE
+  MATCH_WINNER_2WAY // теннис и другие виды спорта без ничьей - исходы "1"/"2"
+}
+
+// Time-series: каждая запись - коэффициент на конкретный исход в конкретный момент времени
+model OddsSnapshot {
+  id      String     @id @default(uuid())
+  market  MarketType
+  outcome String
+  line    Float?
+  price   Float
+
+  bookmakerMatchId String
+  bookmakerMatch   BookmakerMatch @relation(fields: [bookmakerMatchId], references: [id], onDelete: Cascade)
+
+  capturedAt DateTime @default(now())
+
+  @@index([bookmakerMatchId, market, outcome, capturedAt])
+  @@index([capturedAt])
+}
+
+enum FixtureStatus {
+  PENDING   // только получили от ДипСика, ещё не сверяли с БД
+  FOUND     // нашли Match, у которого кэфы ОТ ВСЕХ активных контор
+  GAP       // Match не нашли вообще, или нашли, но не хватает контор -
+            // цель для точечного поиска по сайтам контор (этап 3 плана)
+  NOT_FOUND // точечный поиск по конторам тоже ничего не дал - похоже,
+            // ДипСик придумал матч (см. project-betmark про риск галлюцинаций в качестве источника расписания)
+}
+
+// Эталонный список "что вообще должно быть" от ДипСика
+model AiFixture {
+  id          String        @id @default(uuid())
+  homeTeam    String
+  awayTeam    String
+  leagueKey   String        // канонический ключ из lib/topLeagues.ts (АПЛ, Ла Лига, ...)
+  kickoffDate String        // дата от ДипСика как есть (YYYY-MM-DD) - может быть неточной
+  status      FixtureStatus @default(PENDING)
+  matchId     String?       // Match, с которым сопоставили (если нашли)
+  missingBookmakers String? @db.Text // csv слагов контор, которых не хватает (если GAP)
+  note        String?       @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([homeTeam, awayTeam, leagueKey, kickoffDate])
+  @@index([status])
+}
+
+// Кэш перевода имён команд/игроков Book G - Book G отдаёт названия по-английски ("Liverpool")
+model TeamNameTranslation {
+  id             String   @id @default(uuid())
+  sourceSlug     String // "bookg" - на будущее, если появится ещё один англоязычный источник
+  originalName   String
+  translatedName String
+  createdAt      DateTime @default(now())
+
+  @@unique([sourceSlug, originalName])
+}
+
+model AutoTrackLeague {
+  id        String  @id @default(uuid())
+  sportSlug String // "football" | "hockey"
+  leagueKey String // topLeagueKey()/topHockeyKey() - "РПЛ", "АПЛ", "КХЛ", ...
+
+  active         Boolean         @default(true)
+  bookmakerSlugs String[]        @default(["booka"])
+  detailLevel    LiveDetailLevel @default(MODERATE)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([sportSlug, leagueKey])
+}
+
+model BookkLiveOdds {
+  id        String   @id @default(uuid())
+  matchKey  String   @unique
+  price1    Float?
+  priceX    Float?
+  price2    Float?
+  updatedAt DateTime @updatedAt
+}
+
+// Настройки аккаунта Betmark
+model UserSetting {
+  username     String   @id
+  cryptoOnMain String[] @default([])
+  updatedAt    DateTime @updatedAt
+  // Личные настройки страницы /live скрытые отслеживания, свои конторы, источники, сортировка
+  livePrefs Json?
+}
+
+// Матч, скрытый кнопкой "Удалить -> только у этого аккаунта"
+model HiddenMatch {
+  id        String   @id @default(uuid())
+  username  String
+  matchId   String
+  createdAt DateTime @default(now())
+
+  @@unique([username, matchId])
+  @@index([username])
+}
+
+// ===== Сканер вилок раздел /forks) ===== Активная или недавно закончившаяся вилка. id детерминированный
+model Fork {
+  id           String    @id
+  kind         String // "prematch" | "live"
+  matchId      String
+  sport        String
+  market       String // MATCH_WINNER_1X2 | MATCH_WINNER_2WAY | (позже) TOTAL_OVER_UNDER | HANDICAP
+  line         Float?
+  outcomes     Int // число исходов вилки (2 или 3)
+  profitPct    Float // доход по ценам "как есть" (до комиссии бирж)
+  maxProfitPct Float
+  legs         Json // [{outcome, slug, price, overPct, capturedAt, confirmedAt, bmId, externalId, sourceUrl, isExchange}]
+  meta         Json // команды, лига, время начала, признаки лиги, для Live - счёт и минута
+  bookmakers   String[] // конторы связки (для быстрых фильтров)
+  qsig         String    @default("") // подпись цен матча (сканер сравнивает её вместо всей меты)
+  active       Boolean   @default(true)
+  firstSeenAt  DateTime  @default(now())
+  lastSeenAt   DateTime  @default(now())
+  endedAt      DateTime?
+
+  @@index([active, kind])
+  @@index([matchId])
+  @@index([endedAt])
+}
+
+// Личные настройки сканера (фильтры, сортировка, калькулятор, звук, валюты, ссылки) - один JSON на аккаунт
+model ForkUserSettings {
+  username  String   @id
+  data      Json
+  updatedAt DateTime @updatedAt
+}
+
+// Скрытое пользователем: вилка (key = id вилки), матч (key = matchId)
+model ForkHidden {
+  id        String   @id @default(uuid())
+  username  String
+  kind      String // "fork" | "match" | "pair"
+  key       String
+  label     String   @default("")
+  createdAt DateTime @default(now())
+
+  @@unique([username, kind, key])
+  @@index([username])
+}
+
+// Журнал ставок по вилкам: что пользователь реально поставил
+model ForkBet {
+  id             String    @id @default(uuid())
+  username       String
+  forkId         String?
+  kind           String // prematch | live
+  matchId        String
+  sport          String
+  market         String
+  line           Float?
+  title          String // "Команда - Команда"
+  league         String    @default("")
+  kickoffAt      DateTime?
+  legs           Json // [{slug, outcome, price, stake, currency, stakeRub, net}]
+  totalStakeRub  Float
+  expectedProfit Float // ожидаемый доход в рублях
+  status         String    @default("open") // open | settled
+  winOutcome     String? // "1" | "X" | "2" | "void"
+  resultRub      Float? // фактический результат в рублях (+/-)
+  settledBy      String? // "auto" | "manual"
+  note           String    @default("")
+  createdAt      DateTime  @default(now())
+  settledAt      DateTime?
+
+  @@index([username, createdAt])
+  @@index([status])
+}
+
+// Live-кэфы Book C от выделенной машины-сборщика
+model BookcLiveOdds {
+  id        String   @id @default(uuid())
+  matchKey  String   @unique
+  price1    Float?
+  priceX    Float?
+  price2    Float?
+  updatedAt DateTime @updatedAt
+}

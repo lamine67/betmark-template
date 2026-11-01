@@ -1,0 +1,22 @@
+{
+  "sports": {
+    "football": true,
+    "tennis": true,
+    "hockey": true
+  },
+  "fullScan": false,
+  "bookmakers": {
+    "booka": true,
+    "bookb": true,
+    "bookc": true,
+    "bookd": true
+  },
+  "aiChecks": true,
+  "fastIntervalSec": 60,
+  "fullIntervalSec": 3600,
+  "defaultHiddenBookmakers": [],
+  "prematchIntervals": {},
+  "liveIntervals": {},
+  "cryptoDisabled": [],
+  "reportBooks": []
+}
